@@ -198,7 +198,10 @@ def get_market_cap_fast(ticker: str) -> Optional[float]:
             if attempt > 0:
                 time.sleep(2 ** attempt + random.uniform(0.2, 0.8))
             fi = yf.Ticker(ticker, session=YF_SESSION).fast_info
-            mc = getattr(fi, "market_cap", None)
+            try:
+                mc = fi["marketCap"]
+            except (KeyError, TypeError):
+                mc = None
             return float(mc) if mc else None
         except Exception:
             if attempt == 2:
@@ -396,10 +399,22 @@ def get_stock_info(ticker: str) -> Dict[str, Any]:
 
             # fast_info for lightweight fields (less likely to be rate-limited)
             fi = t.fast_info
-            price = getattr(fi, "last_price", None)
-            market_cap = getattr(fi, "market_cap", None)
-            week52_high = getattr(fi, "year_high", None)
-            week52_low = getattr(fi, "year_low", None)
+            try:
+                price = fi["lastPrice"]
+            except (KeyError, TypeError):
+                price = None
+            try:
+                market_cap = fi["marketCap"]
+            except (KeyError, TypeError):
+                market_cap = None
+            try:
+                week52_high = fi["yearHigh"]
+            except (KeyError, TypeError):
+                week52_high = None
+            try:
+                week52_low = fi["yearLow"]
+            except (KeyError, TypeError):
+                week52_low = None
 
             # .info for fields not in fast_info (name, float, volume, industry)
             info: Dict[str, Any] = {}
