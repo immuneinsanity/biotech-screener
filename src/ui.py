@@ -11,8 +11,9 @@ import streamlit as st
 
 from src.data import (
     build_screener_row,
+    get_biotech_universe,
     get_clinical_trials,
-    get_full_universe,
+    get_market_cap_fast,
     get_price_history,
     get_stock_info,
     load_catalysts,
@@ -115,20 +116,65 @@ def render_screener() -> None:
             st.rerun()
 
     extra_tickers = [t.strip().upper() for t in extra_raw.split(",") if t.strip()] if extra_raw else []
-    universe = get_full_universe(list(watchlist.keys()) + extra_tickers)
 
-    # Load data with progress
-    st.markdown(f"Loading data for **{len(universe)} tickers**…")
-    prog = st.progress(0)
-    rows = []
+    # Build universe: dynamic sources + watchlist + manually added tickers
+    universe_base, dynamic_ok = get_biotech_universe()
+    seen = set(universe_base)
+    universe = list(universe_base)
+    for t in list(watchlist.keys()) + extra_tickers:
+        t = t.strip().upper()
+        if t and t not in seen:
+            universe.append(t)
+            seen.add(t)
+
+    # Universe info + fallback warning
+    st.caption(f"Universe: **{len(universe)} tickers** (refreshed daily)")
+    if not dynamic_ok:
+        st.warning(
+            "⚠️ Could not fetch dynamic universe (SEC EDGAR / ETF feeds unreachable). "
+            "Showing static fallback list."
+        )
+
+    MAX_DISPLAY = 100
+
+    # ── Pass 1: lightweight market-cap pre-filter ──────────────────────────────
+    st.markdown(f"Screening **{len(universe)}** tickers…")
+    prog1 = st.progress(0)
+    passing: List[str] = []
+    mc_cache: dict = {}
+
     for i, ticker in enumerate(universe):
+        mc = get_market_cap_fast(ticker)
+        mc_cache[ticker] = mc
+        prog1.progress((i + 1) / len(universe))
+
+        mc_m = (mc or 0) / 1e6
+        if mc is None or (cap_min <= mc_m <= cap_max):
+            passing.append(ticker)
+
+    prog1.empty()
+
+    # If we have more than MAX_DISPLAY, keep highest market-cap tickers
+    if len(passing) > MAX_DISPLAY:
+        passing.sort(key=lambda t: mc_cache.get(t) or 0, reverse=True)
+        st.info(
+            f"Showing top {MAX_DISPLAY} by market cap "
+            f"({len(passing)} tickers passed the cap filter)."
+        )
+        passing = passing[:MAX_DISPLAY]
+
+    # ── Pass 2: full data fetch for tickers that passed pre-filter ─────────────
+    st.markdown(f"Loading data for **{len(passing)} tickers**…")
+    prog2 = st.progress(0)
+    rows = []
+    for i, ticker in enumerate(passing):
         rows.append(build_screener_row(ticker, catalysts))
-        prog.progress((i + 1) / len(universe))
-    prog.empty()
+        prog2.progress((i + 1) / len(passing))
+    prog2.empty()
 
     df = pd.DataFrame(rows)
 
-    # Apply market cap filter
+    # Apply market cap filter (exact, using full .info values)
     if cap_max > 0:
         df = df[
             (df["Mkt Cap ($M)"].isna() | (df["Mkt Cap ($M)"] >= cap_min)) &

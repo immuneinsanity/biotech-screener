@@ -2,7 +2,10 @@
 Data fetching layer: yfinance, SEC EDGAR, ClinicalTrials.gov, and SQLite storage.
 """
 
+import io
 import os
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,9 +23,9 @@ from src.db import (
     delete_catalyst as _db_delete_catalyst,
 )
 
-# ─── Curated small/micro-cap biotech universe ─────────────────────────────────
+# ─── Curated small/micro-cap biotech universe (static fallback) ───────────────
 
-BIOTECH_UNIVERSE: List[str] = [
+BIOTECH_UNIVERSE_FALLBACK: List[str] = [
     # CNS / Neuro
     "SAVA", "AVXL", "PRAX", "XENE", "ALEC", "DNLI", "ACMR", "ACAD", "SAGE",
     # Oncology / Immunotherapy
@@ -45,6 +48,131 @@ BIOTECH_UNIVERSE: List[str] = [
     # Surgery / MedTech-adjacent
     "TMDX", "NRIX", "NBIX", "SGEN",
 ]
+
+# Keep old name as alias so any other references don't break
+BIOTECH_UNIVERSE = BIOTECH_UNIVERSE_FALLBACK
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_biotech_universe() -> Tuple[List[str], bool]:
+    """
+    Build a dynamic biotech/pharma universe from SEC EDGAR SIC codes and ETF holdings.
+
+    Returns:
+        (tickers, dynamic_succeeded) where dynamic_succeeded is False when all
+        external fetches failed and we are using only the static fallback list.
+
+    Cached for 24 hours.
+    """
+    tickers: set = set()
+    sources_ok = 0
+
+    # ── Source 1: SEC EDGAR Atom feed – SIC 2836 (Pharma) + 8731 (Bio Research) ──
+    for sic in ("2836", "8731"):
+        try:
+            url = (
+                "https://www.sec.gov/cgi-bin/browse-edgar"
+                f"?action=getcompany&SIC={sic}&dateb=&owner=include"
+                "&count=400&search_text=&output=atom"
+            )
+            r = requests.get(url, headers=EDGAR_HEADERS, timeout=25)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            ns = {"a": "http://www.w3.org/2005/Atom"}
+            found = 0
+            for entry in root.findall("a:entry", ns):
+                title_el = entry.find("a:title", ns)
+                if title_el is None or not title_el.text:
+                    continue
+                # Titles are formatted: "COMPANY NAME (TICKER)"
+                m = re.search(r"\(([A-Z]{1,5})\)\s*$", title_el.text.strip())
+                if m:
+                    tickers.add(m.group(1))
+                    found += 1
+            if found > 0:
+                sources_ok += 1
+        except Exception:
+            pass
+
+    # ── Source 2: XBI (SPDR S&P Biotech ETF) holdings XLSX ───────────────────
+    try:
+        xbi_url = (
+            "https://www.ssga.com/us/en/intermediary/etfs/library-content"
+            "/products/fund-data/etfs/us/holdings-daily-us-en-xbi.xlsx"
+        )
+        r = requests.get(xbi_url, headers={"User-Agent": EDGAR_HEADERS["User-Agent"]}, timeout=30)
+        r.raise_for_status()
+        raw = io.BytesIO(r.content)
+        # Scan for the row that contains "Ticker" as a header
+        probe = pd.read_excel(raw, header=None, nrows=10)
+        header_row = None
+        for idx, row in probe.iterrows():
+            if any(str(v).strip().lower() == "ticker" for v in row.values):
+                header_row = idx
+                break
+        if header_row is not None:
+            raw.seek(0)
+            xbi_df = pd.read_excel(raw, header=header_row)
+            tcol = next((c for c in xbi_df.columns if str(c).strip().lower() == "ticker"), None)
+            if tcol:
+                for t in xbi_df[tcol].dropna():
+                    t = str(t).strip().upper()
+                    if t.isalpha() and 1 <= len(t) <= 5:
+                        tickers.add(t)
+                sources_ok += 1
+    except Exception:
+        pass
+
+    # ── Source 3: IBB (iShares Nasdaq Biotechnology ETF) holdings CSV ─────────
+    try:
+        ibb_url = (
+            "https://www.ishares.com/us/products/239699/ishares-nasdaq-biotechnology-etf"
+            "/1467271812596.ajax?fileType=csv&fileName=IBB_holdings&dataType=fund"
+        )
+        r = requests.get(
+            ibb_url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.ishares.com"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        lines = r.text.splitlines()
+        # iShares CSVs have fund-level metadata rows before the real header
+        header_idx = next(
+            (i for i, line in enumerate(lines) if "ticker" in line.lower()), None
+        )
+        if header_idx is not None:
+            ibb_df = pd.read_csv(
+                io.StringIO("\n".join(lines[header_idx:])), on_bad_lines="skip"
+            )
+            tcol = next((c for c in ibb_df.columns if str(c).strip().lower() == "ticker"), None)
+            if tcol:
+                for t in ibb_df[tcol].dropna():
+                    t = str(t).strip().upper()
+                    if t.isalpha() and 1 <= len(t) <= 5:
+                        tickers.add(t)
+                sources_ok += 1
+    except Exception:
+        pass
+
+    # ── Always include the curated fallback list ──────────────────────────────
+    tickers.update(BIOTECH_UNIVERSE_FALLBACK)
+
+    cleaned = sorted({
+        t.upper() for t in tickers
+        if t and isinstance(t, str) and t.isalpha() and 1 <= len(t) <= 5
+    })
+    return cleaned, sources_ok > 0
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_market_cap_fast(ticker: str) -> Optional[float]:
+    """Lightweight market cap fetch via yfinance fast_info (skips heavy .info call)."""
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        mc = getattr(fi, "market_cap", None)
+        return float(mc) if mc else None
+    except Exception:
+        return None
 
 # ─── SEC EDGAR ────────────────────────────────────────────────────────────────
 
@@ -424,7 +552,8 @@ def build_screener_row(ticker: str, catalysts: dict) -> Dict[str, Any]:
 
 def get_full_universe(extra_tickers: Optional[List[str]] = None) -> List[str]:
     """Return deduplicated universe + any watchlist/extra tickers."""
-    base = list(BIOTECH_UNIVERSE)
+    base, _ = get_biotech_universe()
+    base = list(base)
     if extra_tickers:
         for t in extra_tickers:
             t = t.strip().upper()
