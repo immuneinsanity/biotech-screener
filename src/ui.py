@@ -44,16 +44,22 @@ def runway_color_css(days: Optional[int]) -> str:
     return "#ff4b4b"
 
 
-def days_badge(days: Optional[int]) -> str:
+def days_badge(days: Optional[int], source: Optional[str] = None) -> str:
+    if source == "Manual":
+        src = " Manual"
+    elif source == "ClinicalTrials":
+        src = " CT.gov"
+    else:
+        src = ""
     if days is None:
         return "—"
     if days < 0:
-        return f"⚠️ {abs(days)}d ago"
+        return f"⚠️ {abs(days)}d ago{src}"
     if days <= 30:
-        return f"🔥 {days}d"
+        return f"🔴 {days}d{src}"
     if days <= 90:
-        return f"📅 {days}d"
-    return f"🗓 {days}d"
+        return f"🟡 {days}d{src}"
+    return f"🟢 {days}d{src}"
 
 
 def fmt_mktcap(val: Optional[float]) -> str:
@@ -170,7 +176,10 @@ def render_screener() -> None:
     )
     display["Runway"] = df["Runway (days)"].apply(runway_badge)
     display["Next Catalyst"] = df["Next Catalyst"].fillna("—")
-    display["Days to Cat."] = df["Days to Cat."].apply(days_badge)
+    display["Days to Cat."] = df.apply(
+        lambda row: days_badge(row["Days to Cat."], row.get("Catalyst Source")),
+        axis=1,
+    )
     display["Last 10-Q"] = df["Last 10-Q"].fillna("—")
     display["⭐"] = df["Ticker"].apply(lambda t: "★" if t in watchlist else "")
     display["_ticker_raw"] = df["Ticker"]

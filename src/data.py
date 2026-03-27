@@ -24,23 +24,26 @@ from src.db import (
 
 BIOTECH_UNIVERSE: List[str] = [
     # CNS / Neuro
-    "SAVA", "AVXL", "PRAX", "XENE", "ALEC", "DNLI", "ACMR",
+    "SAVA", "AVXL", "PRAX", "XENE", "ALEC", "DNLI", "ACMR", "ACAD", "SAGE",
     # Oncology / Immunotherapy
     "AGEN", "MGNX", "IMTX", "NKTX", "JANX", "FATE", "IOVA", "RCUS", "RAPT", "TGTX",
+    "EXEL", "KRTX", "RXRX", "ATXS", "IOVA",
     # Gene Editing / Cell Therapy
-    "NTLA", "BEAM", "EDIT", "VYGR", "GRPH",
+    "NTLA", "BEAM", "EDIT", "VYGR", "GRPH", "CRSP",
     # Rare Disease / Hematology
-    "KROS", "PTGX", "AGIO", "FOLD", "ACRS",
+    "KROS", "PTGX", "AGIO", "FOLD", "ACRS", "RARE", "BLUE", "SRPT", "BMRN", "ALNY",
     # Autoimmune / Inflammation
-    "IMVT", "KYMR",
+    "IMVT", "KYMR", "VKTX",
     # Cardiovascular / Metabolic
-    "VERV", "LXRX",
+    "VERV", "LXRX", "IONS",
     # Ophthalmology / Dermatology
-    "TARS", "ARQT",
-    # Infectious Disease / Other
-    "OCGN", "NVAX", "CDTX",
+    "TARS", "ARQT", "GKOS",
+    # Infectious Disease / mRNA / Other
+    "OCGN", "NVAX", "CDTX", "MRNA",
     # Drug Delivery / Platform
     "HALO", "FULC", "ATOS", "PHAT", "RVNC",
+    # Surgery / MedTech-adjacent
+    "TMDX", "NRIX", "NBIX", "SGEN",
 ]
 
 # ─── SEC EDGAR ────────────────────────────────────────────────────────────────
@@ -301,6 +304,83 @@ def get_clinical_trials(company_name: str, ticker: str = "") -> List[Dict[str, A
         return []
 
 
+# ─── Catalyst date resolution ─────────────────────────────────────────────────
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def _get_ct_primary_completion(ticker: str, company_name: str) -> Optional[str]:
+    """
+    Query ClinicalTrials.gov for the earliest future Phase 2/3 primary completion
+    date from active trials sponsored by this company.
+    Returns a date string "YYYY-MM-DD" or None.
+    """
+    today = datetime.now().date()
+    query = ticker if ticker else company_name.split()[0]
+    try:
+        url = "https://clinicaltrials.gov/api/v2/studies"
+        params = {
+            "query.spons": query,
+            "filter.overallStatus": "RECRUITING,ACTIVE_NOT_RECRUITING",
+            "pageSize": 20,
+            "fields": "NCTId,Phase,OverallStatus,PrimaryCompletionDate",
+        }
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        studies = r.json().get("studies", [])
+
+        earliest = None
+        for s in studies:
+            proto = s.get("protocolSection", {})
+            design_mod = proto.get("designModule", {})
+            status_mod = proto.get("statusModule", {})
+            phases = design_mod.get("phases", [])
+
+            if not any(p in ("PHASE2", "PHASE3") for p in phases):
+                continue
+
+            pcd = status_mod.get("primaryCompletionDateStruct", {}).get("date", "")
+            if not pcd:
+                continue
+
+            try:
+                fmt = "%Y-%m" if len(pcd) == 7 else "%Y-%m-%d"
+                pcd_date = datetime.strptime(pcd, fmt).date()
+                if pcd_date >= today and (earliest is None or pcd_date < earliest):
+                    earliest = pcd_date
+            except ValueError:
+                continue
+
+        return earliest.strftime("%Y-%m-%d") if earliest else None
+    except Exception:
+        return None
+
+
+def get_next_catalyst_date(
+    ticker: str, company_name: str, catalysts: dict
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (date_str, source) for the nearest upcoming catalyst.
+    source is 'Manual', 'ClinicalTrials', or None.
+    Checks manually entered DB dates first; falls back to CT.gov completion dates.
+    """
+    today = datetime.now().date()
+
+    cat_entry = catalysts.get(ticker.upper(), {})
+    manual_date = cat_entry.get("next_catalyst_date", "")
+    if manual_date:
+        try:
+            d = datetime.strptime(manual_date, "%Y-%m-%d").date()
+            if d >= today:
+                return manual_date, "Manual"
+        except ValueError:
+            pass
+
+    ct_date = _get_ct_primary_completion(ticker, company_name)
+    if ct_date:
+        return ct_date, "ClinicalTrials"
+
+    return None, None
+
+
 # ─── Screener DataFrame builder ───────────────────────────────────────────────
 
 def build_screener_row(ticker: str, catalysts: dict) -> Dict[str, Any]:
@@ -308,10 +388,8 @@ def build_screener_row(ticker: str, catalysts: dict) -> Dict[str, Any]:
     stock = get_stock_info(ticker)
     edgar = get_edgar_financials(ticker)
 
-    # Catalyst from local store
-    cat_entry = catalysts.get(ticker.upper(), {})
-    next_catalyst = cat_entry.get("next_catalyst_date", "")
-    cat_label = cat_entry.get("catalyst_label", "")
+    next_catalyst, catalyst_source = get_next_catalyst_date(ticker, stock["name"], catalysts)
+    cat_label = catalysts.get(ticker.upper(), {}).get("catalyst_label", "")
 
     days_to_cat: Optional[int] = None
     if next_catalyst:
@@ -332,9 +410,10 @@ def build_screener_row(ticker: str, catalysts: dict) -> Dict[str, Any]:
         "Qtr Burn ($M)": edgar["quarterly_burn"],
         "Runway (days)": edgar["runway_days"],
         "Last 10-Q": edgar["last_filing_date"],
-        "Next Catalyst": cat_label or next_catalyst,
-        "Catalyst Date": next_catalyst,
+        "Next Catalyst": cat_label or next_catalyst or "",
+        "Catalyst Date": next_catalyst or "",
         "Days to Cat.": days_to_cat,
+        "Catalyst Source": catalyst_source,
         "_float": stock["float_shares"],
         "_avg_vol": stock["avg_volume"],
         "_52wk_high": stock["week52_high"],
