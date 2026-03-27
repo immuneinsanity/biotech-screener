@@ -56,7 +56,7 @@ def days_badge(days: Optional[int], source: Optional[str] = None) -> str:
     if days is None:
         return "—"
     if days < 0:
-        return f"⚠️ {abs(days)}d ago{src}"
+        return f"⚠️ Expired{src}"
     if days <= 30:
         return f"🔴 {days}d{src}"
     if days <= 90:
@@ -322,6 +322,17 @@ def render_watchlist() -> None:
                 "Label", value=cat.get("catalyst_label", ""),
                 key=f"catlabel_{ticker}", placeholder="Phase 2 top-line data"
             )
+            # Show past-date indicator (visible history, but not counted as next catalyst)
+            if cat_date:
+                try:
+                    _cd = datetime.strptime(cat_date, "%Y-%m-%d").date()
+                    if _cd <= datetime.now().date():
+                        st.caption(
+                            f"<span style='color:#888'>(past — {cat_date} · not counted as next catalyst)</span>",
+                            unsafe_allow_html=True,
+                        )
+                except ValueError:
+                    pass
 
             btn_cols = st.columns([1, 1, 4])
             if btn_cols[0].button("Save", key=f"save_{ticker}", use_container_width=True):

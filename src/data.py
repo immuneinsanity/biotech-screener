@@ -518,7 +518,7 @@ def _get_ct_primary_completion(ticker: str, company_name: str) -> Optional[str]:
             try:
                 fmt = "%Y-%m" if len(pcd) == 7 else "%Y-%m-%d"
                 pcd_date = datetime.strptime(pcd, fmt).date()
-                if pcd_date >= today and (earliest is None or pcd_date < earliest):
+                if pcd_date > today and (earliest is None or pcd_date < earliest):
                     earliest = pcd_date
             except ValueError:
                 continue
@@ -543,7 +543,7 @@ def get_next_catalyst_date(
     if manual_date:
         try:
             d = datetime.strptime(manual_date, "%Y-%m-%d").date()
-            if d >= today:
+            if d > today:
                 return manual_date, "Manual"
         except ValueError:
             pass
@@ -572,6 +572,12 @@ def build_screener_row(ticker: str, catalysts: dict) -> Dict[str, Any]:
             days_to_cat = (cat_date - datetime.now()).days
         except ValueError:
             pass
+
+    # Double-check: if days <= 0, treat as no upcoming catalyst
+    if days_to_cat is not None and days_to_cat <= 0:
+        days_to_cat = None
+        next_catalyst = None
+        catalyst_source = None
 
     mkt_cap_m = (stock["market_cap"] or 0) / 1e6  # in millions
 
