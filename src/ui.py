@@ -2,6 +2,7 @@
 UI rendering components for the Biotech Screener.
 """
 
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -147,6 +148,7 @@ def render_screener() -> None:
         mc = get_market_cap_fast(ticker)
         mc_cache[ticker] = mc
         prog1.progress((i + 1) / len(universe))
+        time.sleep(0.3)
 
         mc_m = (mc or 0) / 1e6
         if mc is None or (cap_min <= mc_m <= cap_max):
@@ -170,6 +172,7 @@ def render_screener() -> None:
     for i, ticker in enumerate(passing):
         rows.append(build_screener_row(ticker, catalysts))
         prog2.progress((i + 1) / len(passing))
+        time.sleep(0.3)
     prog2.empty()
 
     df = pd.DataFrame(rows)
@@ -248,6 +251,18 @@ def render_screener() -> None:
         selected_ticker = display.iloc[idx]["_ticker_raw"]
         st.session_state["detail_ticker"] = selected_ticker
         st.session_state["show_detail"] = True
+
+    # Debug info expander
+    with st.expander("Debug Info", expanded=False):
+        price_none = int(df["Price"].isna().sum())
+        mktcap_none = int(df["Mkt Cap ($M)"].isna().sum())
+        st.write(f"Tickers with no price: **{price_none}** / {len(df)}")
+        st.write(f"Tickers with no market cap: **{mktcap_none}** / {len(df)}")
+        sample_tickers = df["Ticker"].head(3).tolist()
+        if sample_tickers:
+            st.write("Sample raw data (first 3 tickers):")
+            sample = df[df["Ticker"].isin(sample_tickers)][["Ticker", "Price", "Mkt Cap ($M)"]].copy()
+            st.dataframe(sample, hide_index=True)
 
     # Inline detail panel
     if st.session_state.get("show_detail") and st.session_state.get("detail_ticker"):
