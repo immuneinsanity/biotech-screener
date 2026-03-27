@@ -15,8 +15,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from src.db import (
     get_catalysts as _db_get_catalysts,
@@ -26,28 +24,6 @@ from src.db import (
     save_to_watchlist as _db_save_watchlist,
     delete_catalyst as _db_delete_catalyst,
 )
-
-# ─── yfinance session (browser-like headers + HTTP retry) ────────────────────
-
-def _make_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    })
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    return session
-
-
-YF_SESSION = _make_session()
-
 
 # ─── Curated small/micro-cap biotech universe (static fallback) ───────────────
 
@@ -197,7 +173,7 @@ def get_market_cap_fast(ticker: str) -> Optional[float]:
         try:
             if attempt > 0:
                 time.sleep(2 ** attempt + random.uniform(0.2, 0.8))
-            fi = yf.Ticker(ticker, session=YF_SESSION).fast_info
+            fi = yf.Ticker(ticker).fast_info
             try:
                 mc = fi["marketCap"]
             except (KeyError, TypeError):
@@ -395,7 +371,7 @@ def get_stock_info(ticker: str) -> Dict[str, Any]:
             if attempt > 0:
                 time.sleep(2 ** attempt + random.uniform(0.2, 0.8))
 
-            t = yf.Ticker(ticker, session=YF_SESSION)
+            t = yf.Ticker(ticker)
 
             # fast_info for lightweight fields (less likely to be rate-limited)
             fi = t.fast_info
@@ -445,7 +421,7 @@ def get_stock_info(ticker: str) -> Dict[str, Any]:
 def get_price_history(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
     """Return OHLCV DataFrame or None on failure."""
     try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True, session=YF_SESSION)
+        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
         if df.empty:
             return None
         return df
