@@ -242,7 +242,7 @@ def render_screener() -> None:
     display["Name"] = df["Name"].str[:30]
     display["Price"] = df["Price"].apply(fmt_price)
     display["Mkt Cap"] = df["Mkt Cap ($M)"].apply(fmt_mktcap)
-    display["Cash ($M)"] = df["Cash ($M)"].apply(
+    display["Liquidity ($M)"] = df["Liquidity ($M)"].apply(
         lambda x: f"${x:.1f}M" if pd.notna(x) else "—"
     )
     display["Qtr Burn"] = df["Qtr Burn ($M)"].apply(

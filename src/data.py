@@ -338,10 +338,24 @@ def get_edgar_financials(ticker: str) -> Dict[str, Any]:
     filing_date: Optional[str] = None
     cash_components: Optional[str] = None
 
+    # Long-term investment concepts (used in both branches below)
+    _LT_CONCEPTS = [
+        "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
+        "DebtSecuritiesAvailableForSaleNoncurrent",
+        "LongTermInvestments",
+    ]
+
     all_in_one = latest_10q("CashCashEquivalentsAndShortTermInvestments")
     if all_in_one is not None:
         cash_val, filing_date = all_in_one
         cash_components = "cash+STI"
+
+        # The all-in-one concept already covers cash + short-term; add long-term on top.
+        # Deduplicate: take the largest non-None value (they likely report the same pool).
+        lt_vals = [v for v in (get_value_for_date(c, filing_date) for c in _LT_CONCEPTS) if v is not None]
+        if lt_vals:
+            cash_val += max(lt_vals)
+            cash_components += "+LTI"
     else:
         # Find the anchor filing date from the primary cash concept
         anchor = latest_10q("CashAndCashEquivalentsAtCarryingValue")
@@ -349,16 +363,22 @@ def get_edgar_financials(ticker: str) -> Dict[str, Any]:
             _, filing_date = anchor
 
             cash_base = get_value_for_date("CashAndCashEquivalentsAtCarryingValue", filing_date)
-            sti       = get_value_for_date("ShortTermInvestments", filing_date)
-            mkt_sec   = get_value_for_date("MarketableSecuritiesCurrent", filing_date)
-            afs       = get_value_for_date("AvailableForSaleSecuritiesDebtSecuritiesCurrent", filing_date)
-            htm       = get_value_for_date("HeldToMaturitySecuritiesCurrent", filing_date)
 
-            # Deduplicate STI vs AFS – they often report the same pool; take the larger
-            if sti is not None and afs is not None:
-                sti_component = max(sti, afs)
-            else:
-                sti_component = sti if sti is not None else afs
+            # Short-term investments – deduplicate overlapping concepts; take the largest.
+            _ST_CONCEPTS = [
+                "ShortTermInvestments",
+                "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+                "DebtSecuritiesAvailableForSaleCurrent",
+                "MarketableSecuritiesCurrent",
+            ]
+            st_vals = [v for v in (get_value_for_date(c, filing_date) for c in _ST_CONCEPTS) if v is not None]
+            sti_component = max(st_vals) if st_vals else None
+
+            # Long-term investments – deduplicate; take the largest.
+            lt_vals = [v for v in (get_value_for_date(c, filing_date) for c in _LT_CONCEPTS) if v is not None]
+            lt_component = max(lt_vals) if lt_vals else None
+
+            htm = get_value_for_date("HeldToMaturitySecuritiesCurrent", filing_date)
 
             total = 0.0
             labels = []
@@ -368,9 +388,9 @@ def get_edgar_financials(ticker: str) -> Dict[str, Any]:
             if sti_component is not None:
                 total += sti_component
                 labels.append("STI")
-            if mkt_sec is not None:
-                total += mkt_sec
-                labels.append("MktSec")
+            if lt_component is not None:
+                total += lt_component
+                labels.append("LTI")
             if htm is not None:
                 total += htm
                 labels.append("HTM")
@@ -380,20 +400,52 @@ def get_edgar_financials(ticker: str) -> Dict[str, Any]:
                 cash_components = "+".join(labels)
 
     # ── Quarterly burn (operating cash flow) ─────────────────────────────────
+    # XBRL 10-Q cash flow values are often YTD (Q2 = 6-month total, Q3 = 9-month).
+    # Prefer entries whose period is ~1 quarter (70–100 days) to get a true
+    # single-quarter figure; fall back to dividing YTD by the quarter number.
     burn_val: Optional[float] = None
     for concept in BURN_CONCEPTS:
         data = facts.get(concept, {}).get("units", {}).get("USD", [])
         if not data:
             continue
-        quarterly = [
+
+        entries_with_dates = [
             e for e in data
-            if e.get("form") in ("10-Q",) and e.get("val") is not None
+            if e.get("form") in ("10-Q", "10-K")
+            and e.get("val") is not None
+            and e.get("start") and e.get("end")
         ]
-        quarterly.sort(key=lambda e: e.get("end", ""), reverse=True)
-        recent = quarterly[:2]
-        if recent:
+        if not entries_with_dates:
+            continue
+
+        # Annotate each entry with its duration in days
+        for e in entries_with_dates:
+            try:
+                s = datetime.strptime(e["start"], "%Y-%m-%d")
+                d = datetime.strptime(e["end"], "%Y-%m-%d")
+                e["_days"] = (d - s).days
+            except ValueError:
+                e["_days"] = 0
+
+        # Prefer genuine single-quarter entries (10-Q, ~91 days)
+        single_q = [
+            e for e in entries_with_dates
+            if e.get("form") == "10-Q" and 70 <= e.get("_days", 0) <= 100
+        ]
+        if single_q:
+            single_q.sort(key=lambda e: e.get("end", ""), reverse=True)
+            recent = single_q[:2]
             avg_ocf = sum(e["val"] for e in recent) / len(recent) / 1e6
             burn_val = abs(avg_ocf) if avg_ocf < 0 else None
+            break
+
+        # Fallback: most-recent entry (could be YTD or annual), divide by quarter count
+        entries_with_dates.sort(key=lambda e: e.get("end", ""), reverse=True)
+        best = entries_with_dates[0]
+        days = best.get("_days", 91)
+        quarter_num = max(1, round(days / 91))
+        single_q_val = best["val"] / quarter_num / 1e6
+        burn_val = abs(single_q_val) if single_q_val < 0 else None
         break
 
     runway_days: Optional[int] = None
@@ -643,7 +695,7 @@ def build_screener_row(ticker: str, catalysts: dict) -> Dict[str, Any]:
         "Name": stock["name"],
         "Price": stock["price"],
         "Mkt Cap ($M)": round(mkt_cap_m, 1) if mkt_cap_m else None,
-        "Cash ($M)": edgar["cash"],
+        "Liquidity ($M)": edgar["cash"],
         "Qtr Burn ($M)": edgar["quarterly_burn"],
         "Runway (days)": edgar["runway_days"],
         "Last 10-Q": edgar["last_filing_date"],
