@@ -437,7 +437,9 @@ def render_detail(ticker: str) -> None:
                 unsafe_allow_html=True,
             )
             rc1, rc2 = st.columns(2)
-            rc1.metric("Cash Position", f"${edgar['cash']:.1f}M" if edgar["cash"] else "—")
+            components = edgar.get("cash_components")
+            cash_label = f"Cash ({components})" if components else "Cash Position"
+            rc1.metric(cash_label, f"${edgar['cash']:.1f}M" if edgar["cash"] else "—")
             rc2.metric("Qtr Burn", f"${edgar['quarterly_burn']:.1f}M" if edgar["quarterly_burn"] else "—")
             st.caption(f"Source: SEC EDGAR · Last 10-Q: {edgar.get('last_filing_date', '—')}")
         else:

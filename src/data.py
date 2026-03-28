@@ -214,12 +214,6 @@ EDGAR_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
-# Cash concepts to try, in preference order
-CASH_CONCEPTS = [
-    "CashCashEquivalentsAndShortTermInvestments",
-    "CashAndCashEquivalentsAtCarryingValue",
-    "CashAndCashEquivalentsAndRestrictedCashAndRestrictedCashEquivalents",
-]
 BURN_CONCEPTS = [
     "NetCashProvidedByUsedInOperatingActivities",
 ]
@@ -285,17 +279,21 @@ def get_edgar_financials(ticker: str) -> Dict[str, Any]:
     Pull the most recent 10-Q cash position and quarterly operating burn
     from SEC EDGAR XBRL facts API.
 
+    Sums liquid capital across multiple XBRL line items to avoid understating
+    cash for biotechs that hold capital in short-term treasuries/money markets.
+
     Returns:
         {
-            "cash": float | None,          # in millions
-            "quarterly_burn": float | None, # in millions (absolute value)
+            "cash": float | None,             # in millions
+            "quarterly_burn": float | None,   # in millions (absolute value)
             "runway_days": int | None,
             "last_filing_date": str | None,
+            "cash_components": str | None,    # e.g. "cash+STI+MktSec"
             "source": "edgar" | "unavailable",
         }
     """
     empty = {"cash": None, "quarterly_burn": None, "runway_days": None,
-             "last_filing_date": None, "source": "unavailable"}
+             "last_filing_date": None, "cash_components": None, "source": "unavailable"}
 
     cik = get_cik(ticker)
     if not cik:
@@ -310,7 +308,7 @@ def get_edgar_financials(ticker: str) -> Dict[str, Any]:
         return empty
 
     def latest_10q(concept: str) -> Optional[Tuple[float, str]]:
-        """Return (value_in_millions, end_date) for the most recent 10-Q filing."""
+        """Return (value_in_millions, end_date) for the most recent 10-Q/10-K filing."""
         data = facts.get(concept, {}).get("units", {}).get("USD", [])
         if not data:
             return None
@@ -321,27 +319,72 @@ def get_edgar_financials(ticker: str) -> Dict[str, Any]:
         ]
         if not quarterly:
             return None
-        # Sort by end date descending, prefer 10-Q
         quarterly.sort(key=lambda e: e.get("end", ""), reverse=True)
         best = quarterly[0]
         return best["val"] / 1e6, best["end"]
 
-    # Cash
+    def get_value_for_date(concept: str, end_date: str) -> Optional[float]:
+        """Return value in millions for the given concept at a specific filing end date."""
+        data = facts.get(concept, {}).get("units", {}).get("USD", [])
+        for e in data:
+            if (e.get("end") == end_date
+                    and e.get("form") in ("10-Q", "10-K")
+                    and e.get("val") is not None):
+                return e["val"] / 1e6
+        return None
+
+    # ── Cash: try all-in-one concept first ───────────────────────────────────
     cash_val: Optional[float] = None
     filing_date: Optional[str] = None
-    for concept in CASH_CONCEPTS:
-        result = latest_10q(concept)
-        if result is not None:
-            cash_val, filing_date = result
-            break
+    cash_components: Optional[str] = None
 
-    # Quarterly burn (operating cash flow – typically negative for clinical-stage)
+    all_in_one = latest_10q("CashCashEquivalentsAndShortTermInvestments")
+    if all_in_one is not None:
+        cash_val, filing_date = all_in_one
+        cash_components = "cash+STI"
+    else:
+        # Find the anchor filing date from the primary cash concept
+        anchor = latest_10q("CashAndCashEquivalentsAtCarryingValue")
+        if anchor is not None:
+            _, filing_date = anchor
+
+            cash_base = get_value_for_date("CashAndCashEquivalentsAtCarryingValue", filing_date)
+            sti       = get_value_for_date("ShortTermInvestments", filing_date)
+            mkt_sec   = get_value_for_date("MarketableSecuritiesCurrent", filing_date)
+            afs       = get_value_for_date("AvailableForSaleSecuritiesDebtSecuritiesCurrent", filing_date)
+            htm       = get_value_for_date("HeldToMaturitySecuritiesCurrent", filing_date)
+
+            # Deduplicate STI vs AFS – they often report the same pool; take the larger
+            if sti is not None and afs is not None:
+                sti_component = max(sti, afs)
+            else:
+                sti_component = sti if sti is not None else afs
+
+            total = 0.0
+            labels = []
+            if cash_base is not None:
+                total += cash_base
+                labels.append("cash")
+            if sti_component is not None:
+                total += sti_component
+                labels.append("STI")
+            if mkt_sec is not None:
+                total += mkt_sec
+                labels.append("MktSec")
+            if htm is not None:
+                total += htm
+                labels.append("HTM")
+
+            if total > 0:
+                cash_val = total
+                cash_components = "+".join(labels)
+
+    # ── Quarterly burn (operating cash flow) ─────────────────────────────────
     burn_val: Optional[float] = None
     for concept in BURN_CONCEPTS:
         data = facts.get(concept, {}).get("units", {}).get("USD", [])
         if not data:
             continue
-        # Get last two quarterly filings to average burn
         quarterly = [
             e for e in data
             if e.get("form") in ("10-Q",) and e.get("val") is not None
@@ -363,6 +406,7 @@ def get_edgar_financials(ticker: str) -> Dict[str, Any]:
         "quarterly_burn": round(burn_val, 1) if burn_val is not None else None,
         "runway_days": runway_days,
         "last_filing_date": filing_date,
+        "cash_components": cash_components,
         "source": "edgar" if cash_val is not None else "unavailable",
     }
 
