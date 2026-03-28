@@ -167,6 +167,28 @@ def get_biotech_universe() -> Tuple[List[str], bool]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def get_bulk_market_caps(tickers: tuple) -> dict:
+    """Fetch market caps for many tickers using yf.Tickers in chunks of 50.
+    Returns dict of {ticker: market_cap_float_or_None}"""
+    result = {}
+    chunk_size = 50
+    for i in range(0, len(tickers), chunk_size):
+        chunk = list(tickers[i:i + chunk_size])
+        try:
+            tickers_obj = yf.Tickers(" ".join(chunk))
+            for ticker in chunk:
+                try:
+                    mc = tickers_obj.tickers[ticker].fast_info["marketCap"]
+                    result[ticker] = float(mc) if mc else None
+                except Exception:
+                    result[ticker] = None
+        except Exception:
+            for t in chunk:
+                result[t] = None
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_market_cap_fast(ticker: str) -> Optional[float]:
     """Lightweight market cap fetch via yfinance fast_info (skips heavy .info call)."""
     for attempt in range(3):

@@ -3,6 +3,7 @@ UI rendering components for the Biotech Screener.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,7 @@ import streamlit as st
 from src.data import (
     build_screener_row,
     get_biotech_universe,
+    get_bulk_market_caps,
     get_clinical_trials,
     get_market_cap_fast,
     get_price_history,
@@ -114,6 +116,9 @@ def render_screener() -> None:
         st.markdown("---")
         if st.button("🔄 Refresh Data", use_container_width=True):
             st.cache_data.clear()
+            st.session_state.pop("screener_df", None)
+            st.session_state.pop("screener_ts", None)
+            st.session_state.pop("screener_universe", None)
             st.rerun()
 
     extra_tickers = [t.strip().upper() for t in extra_raw.split(",") if t.strip()] if extra_raw else []
@@ -137,45 +142,68 @@ def render_screener() -> None:
         )
 
     MAX_DISPLAY = 100
+    _CACHE_TTL = 1800  # 30 min
 
-    # ── Pass 1: lightweight market-cap pre-filter ──────────────────────────────
-    st.markdown(f"Screening **{len(universe)}** tickers…")
-    prog1 = st.progress(0)
-    passing: List[str] = []
-    mc_cache: dict = {}
+    now = time.time()
+    universe_sig = tuple(universe)
+    _use_cache = (
+        "screener_df" in st.session_state
+        and now - st.session_state.get("screener_ts", 0) < _CACHE_TTL
+        and st.session_state.get("screener_universe") == universe_sig
+    )
 
-    for i, ticker in enumerate(universe):
-        mc = get_market_cap_fast(ticker)
-        mc_cache[ticker] = mc
-        prog1.progress((i + 1) / len(universe))
-        time.sleep(0.3)
+    if _use_cache:
+        df = st.session_state["screener_df"]
+        st.caption("Using cached data (< 30 min old). Click Refresh to update.")
+    else:
+        # ── Pass 1: bulk market-cap pre-filter ────────────────────────────────
+        st.markdown(f"Screening **{len(universe)}** tickers…")
+        prog1 = st.progress(0)
+        mc_cache = get_bulk_market_caps(universe_sig)
+        prog1.progress(1.0)
+        prog1.empty()
 
-        mc_m = (mc or 0) / 1e6
-        if mc is None or (cap_min <= mc_m <= cap_max):
-            passing.append(ticker)
+        passing: List[str] = []
+        for ticker in universe:
+            mc = mc_cache.get(ticker)
+            mc_m = (mc or 0) / 1e6
+            if mc is None or (cap_min <= mc_m <= cap_max):
+                passing.append(ticker)
 
-    prog1.empty()
+        # If we have more than MAX_DISPLAY, keep highest market-cap tickers
+        if len(passing) > MAX_DISPLAY:
+            passing.sort(key=lambda t: mc_cache.get(t) or 0, reverse=True)
+            st.info(
+                f"Showing top {MAX_DISPLAY} by market cap "
+                f"({len(passing)} tickers passed the cap filter)."
+            )
+            passing = passing[:MAX_DISPLAY]
 
-    # If we have more than MAX_DISPLAY, keep highest market-cap tickers
-    if len(passing) > MAX_DISPLAY:
-        passing.sort(key=lambda t: mc_cache.get(t) or 0, reverse=True)
-        st.info(
-            f"Showing top {MAX_DISPLAY} by market cap "
-            f"({len(passing)} tickers passed the cap filter)."
-        )
-        passing = passing[:MAX_DISPLAY]
+        # ── Pass 2: parallel full data fetch ──────────────────────────────────
+        st.markdown(f"Loading data for **{len(passing)} tickers**…")
+        prog2 = st.progress(0)
+        rows = []
 
-    # ── Pass 2: full data fetch for tickers that passed pre-filter ─────────────
-    st.markdown(f"Loading data for **{len(passing)} tickers**…")
-    prog2 = st.progress(0)
-    rows = []
-    for i, ticker in enumerate(passing):
-        rows.append(build_screener_row(ticker, catalysts))
-        prog2.progress((i + 1) / len(passing))
-        time.sleep(0.3)
-    prog2.empty()
+        def _fetch_row(ticker: str) -> Dict[str, Any]:
+            return build_screener_row(ticker, catalysts)
 
-    df = pd.DataFrame(rows)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_fetch_row, t): t for t in passing}
+            completed = 0
+            for future in as_completed(futures):
+                try:
+                    rows.append(future.result())
+                except Exception:
+                    pass
+                completed += 1
+                prog2.progress(completed / max(len(passing), 1))
+
+        prog2.empty()
+
+        df = pd.DataFrame(rows)
+        st.session_state["screener_df"] = df
+        st.session_state["screener_ts"] = now
+        st.session_state["screener_universe"] = universe_sig
 
     # Apply market cap filter (exact, using full .info values)
     if cap_max > 0:
