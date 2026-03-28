@@ -141,7 +141,6 @@ def render_screener() -> None:
             "Showing static fallback list."
         )
 
-    MAX_DISPLAY = 100
     _CACHE_TTL = 1800  # 30 min
 
     now = time.time()
@@ -169,15 +168,6 @@ def render_screener() -> None:
             mc_m = (mc or 0) / 1e6
             if mc is None or (cap_min <= mc_m <= cap_max):
                 passing.append(ticker)
-
-        # If we have more than MAX_DISPLAY, keep highest market-cap tickers
-        if len(passing) > MAX_DISPLAY:
-            passing.sort(key=lambda t: mc_cache.get(t) or 0, reverse=True)
-            st.info(
-                f"Showing top {MAX_DISPLAY} by market cap "
-                f"({len(passing)} tickers passed the cap filter)."
-            )
-            passing = passing[:MAX_DISPLAY]
 
         # ── Pass 2: parallel full data fetch ──────────────────────────────────
         st.markdown(f"Loading data for **{len(passing)} tickers**…")
@@ -222,9 +212,16 @@ def render_screener() -> None:
     elif runway_filter == "Unknown":
         df = df[df["Runway (days)"].isna()]
 
-    # Sort
-    if sort_col in df.columns:
-        df = df.sort_values(sort_col, ascending=sort_asc, na_position="last")
+    # Smart sort: catalyst stocks (with upcoming dates) bubble to top, sorted by days to catalyst
+    # ascending. Within the non-catalyst group, apply the sidebar sort selection.
+    has_catalyst = df["Days to Cat."].notna() & (df["Days to Cat."] >= 0)
+    df_cat = df[has_catalyst].sort_values("Days to Cat.", ascending=True, na_position="last")
+    df_nocat = df[~has_catalyst]
+    if sort_col in df_nocat.columns:
+        df_nocat = df_nocat.sort_values(sort_col, ascending=sort_asc, na_position="last")
+    else:
+        df_nocat = df_nocat.sort_values("Mkt Cap ($M)", ascending=False, na_position="last")
+    df = pd.concat([df_cat, df_nocat], ignore_index=True)
 
     # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -262,6 +259,7 @@ def render_screener() -> None:
     display["_ticker_raw"] = df["Ticker"]
 
     # Clickable row → detail view
+    st.caption(f"Showing {len(df)} of {len(universe)} tickers that passed filters")
     st.markdown("**Click a row to open Stock Detail →**")
 
     event = st.dataframe(
